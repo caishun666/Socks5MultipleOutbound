@@ -1,0 +1,136 @@
+#!/bin/bash
+
+set -e
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "❌ 请使用 root 用户运行此脚本。"
+  exit 1
+fi
+
+read -p "请输入统一的端口号（例如1080）: " PORT
+read -p "请输入用户名: " USER
+read -s -p "请输入密码: " PASS
+echo ""
+
+echo -e "\n🔄 安装依赖..."
+apt update && apt install -y curl unzip jq iptables iptables-persistent net-tools
+
+XRAY_DIR="/usr/local/xray"
+XRAY_BIN="$XRAY_DIR/xray"
+CONFIG="$XRAY_DIR/config.json"
+
+mkdir -p "$XRAY_DIR"
+cd "$XRAY_DIR"
+
+echo "⬇️ 下载 Xray..."
+curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+unzip -o xray.zip && rm xray.zip
+chmod +x xray
+
+echo "📡 获取 IP 列表..."
+IP_LIST=($(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | sort -u))
+
+echo "⚙️ 生成配置..."
+INBOUND_JSON=""
+OUTBOUND_JSON=""
+ROUTE_RULES=""
+
+for i in "${!IP_LIST[@]}"; do
+  IP="${IP_LIST[$i]}"
+
+  INBOUND_JSON+=$(cat <<EOF
+{
+  "tag": "socks_$i",
+  "port": $PORT,
+  "listen": "$IP",
+  "protocol": "socks",
+  "settings": {
+    "auth": "password",
+    "accounts": [{ "user": "$USER", "pass": "$PASS" }],
+    "udp": true
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": ["http", "tls"]
+  }
+},
+EOF
+)
+
+  OUTBOUND_JSON+=$(cat <<EOF
+{
+  "tag": "out_$i",
+  "protocol": "freedom",
+  "settings": {},
+  "sendThrough": "$IP"
+},
+EOF
+)
+
+  ROUTE_RULES+=$(cat <<EOF
+{
+  "type": "field",
+  "inboundTag": ["socks_$i"],
+  "outboundTag": "out_$i"
+},
+EOF
+)
+done
+
+# 去除尾部逗号
+INBOUND_JSON=$(echo "$INBOUND_JSON" | sed '$ s/},/}/')
+OUTBOUND_JSON=$(echo "$OUTBOUND_JSON" | sed '$ s/},/}/')
+ROUTE_RULES=$(echo "$ROUTE_RULES" | sed '$ s/},/}/')
+
+cat > "$CONFIG" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+$INBOUND_JSON
+  ],
+  "outbounds": [
+$OUTBOUND_JSON
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+$ROUTE_RULES
+    ]
+  }
+}
+EOF
+
+echo "✅ 验证配置文件..."
+if ! $XRAY_BIN -test -config "$CONFIG"; then
+  echo "❌ 配置文件有误，终止执行。"
+  exit 1
+fi
+
+echo "📶 放行端口 $PORT ..."
+iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT
+netfilter-persistent save
+
+echo "🔧 创建 systemd 服务..."
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+ExecStart=$XRAY_BIN -config $CONFIG
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable xray
+systemctl restart xray
+
+echo -e "\n✅ Xray 已部署成功！连接信息："
+for ip in "${IP_LIST[@]}"; do
+  echo "$ip:$PORT 用户名: $USER 密码: $PASS"
+done
