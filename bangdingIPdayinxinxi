@@ -1,0 +1,149 @@
+#!/bin/bash
+
+set -e
+
+# 设置自身可执行权限（如未提前设置）
+chmod +x "$0"
+
+# 检查是否为 root 用户
+if [ "$(id -u)" -ne 0 ]; then
+  echo "❌ 请使用 root 用户运行此脚本。"
+  exit 1
+fi
+
+# 读取基本参数
+read -p "请输入统一的端口号（例如1080）: " PORT
+read -p "请输入用户名: " USER
+read -s -p "请输入密码: " PASS
+echo ""
+
+# 检查 IPv4 地址数量（不含 127.0.0.1）
+REAL_IPS=( $(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.') )
+if [ ${#REAL_IPS[@]} -le 1 ]; then
+  echo -e "\n🧩 当前仅检测到一个公网 IPv4 地址。请输入要绑定的额外 IP 地址（每行一个，输入空行结束）："
+  IP_LIST_INPUT=()
+  while true; do
+    read -p "> " ip
+    [[ -z "$ip" ]] && break
+    IP_LIST_INPUT+=("$ip")
+  done
+
+  # 获取主网卡名
+  IFACE=$(ip -o -4 route show to default | awk '{print $5}')
+  echo "\n🔗 检测到主网卡: $IFACE"
+
+  # 备份原始配置
+  cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%s)
+
+  # 添加绑定
+  for ((i=0; i<${#IP_LIST_INPUT[@]}; i++)); do
+    echo "auto $IFACE:$i" >> /etc/network/interfaces
+    echo "iface $IFACE:$i inet static" >> /etc/network/interfaces
+    echo "  address ${IP_LIST_INPUT[$i]}" >> /etc/network/interfaces
+    echo "  netmask 255.255.255.255" >> /etc/network/interfaces
+    echo "" >> /etc/network/interfaces
+  done
+
+  echo -e "\n💡 已写入 /etc/network/interfaces，正在重启网络服务以生效..."
+  systemctl restart networking
+  sleep 3
+fi
+
+# 再次收集本机所有非127 IPv4
+IP_LIST=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | sort -u)
+
+# 安装依赖
+echo -e "\n🔄 正在更新系统并安装依赖..."
+apt update && apt upgrade -y
+apt install -y curl unzip jq net-tools iptables iptables-persistent
+
+# 下载并安装 Xray Core
+XRAY_DIR="/usr/local/xray"
+XRAY_ZIP_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+mkdir -p "$XRAY_DIR"
+cd "$XRAY_DIR"
+curl -L -o xray.zip "$XRAY_ZIP_URL"
+unzip -o xray.zip
+chmod +x xray
+rm -f xray.zip
+
+# 构建 Xray 配置
+CONFIG_FILE="$XRAY_DIR/config.json"
+echo -e "\n⚙️ 正在生成 Xray 配置文件..."
+echo '{' > "$CONFIG_FILE"
+echo '  "log": { "loglevel": "warning" },' >> "$CONFIG_FILE"
+echo '  "inbounds": [' >> "$CONFIG_FILE"
+
+INDEX=0
+IP_ARR=()
+for IP in $IP_LIST; do
+  IP_ARR+=("$IP")
+  cat >> "$CONFIG_FILE" <<EOF
+    {
+      "tag": "socks_$INDEX",
+      "port": $PORT,
+      "listen": "$IP",
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [
+          { "user": "$USER", "pass": "$PASS" }
+        ],
+        "udp": true
+      }
+    },
+EOF
+  ((INDEX++))
+done
+
+# 清理最后一个逗号
+sed -i '$ s/},/}/' "$CONFIG_FILE"
+echo '  ],' >> "$CONFIG_FILE"
+echo '  "outbounds": [' >> "$CONFIG_FILE"
+echo '    { "protocol": "freedom" }' >> "$CONFIG_FILE"
+echo '  ]' >> "$CONFIG_FILE"
+echo '}' >> "$CONFIG_FILE"
+
+# 放行端口
+echo -e "\n📶 放行端口 $PORT ..."
+iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT
+
+# 保存规则
+echo -e "💾 保存 iptables 规则..."
+netfilter-persistent save
+
+# 创建 systemd 服务
+echo -e "🧩 创建并启动 Xray systemd 服务..."
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$XRAY_DIR/xray -config $XRAY_DIR/config.json
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reexec
+systemctl daemon-reload
+systemctl enable xray
+systemctl restart xray
+
+# 打印连接信息
+echo -e "\n✅ Xray SOCKS5 多IP代理已部署成功！"
+echo "监听 IP 列表："
+for ip in "${IP_ARR[@]}"; do
+  echo "  - $ip"
+done
+
+echo -e "\n连接信息（每行一个）："
+for ip in "${IP_ARR[@]}"; do
+  echo "$ip:$PORT 用户名: $USER 密码: $PASS"
+done
+
+echo -e "\n请确保客户端连接时使用对应IP和端口，并输入正确的用户名和密码。"
