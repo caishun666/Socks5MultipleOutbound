@@ -1,0 +1,19 @@
+	# 添加额外 IP
+# Additional IP address 1
+iface eno1 inet static
+address 192.168.1.1/24
+# Additional IP address 2
+iface eno1 inet static
+address 192.168.1.2/24
+# Additional IP address 3
+iface eno1 inet static
+address 192.168.1.3/24
+# Additional IP address 4
+iface eno1 inet static
+address 192.168.1.4/24
+# Additional IP address 5
+iface eno1 inet static
+address 192.168.1.5/24
+
+#systemctl restart netwroking
+#reboot
